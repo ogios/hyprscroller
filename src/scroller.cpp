@@ -35,6 +35,11 @@ struct Box {
         x = x_;
         y = y_;
     }
+    bool operator == (const Box &box) {
+        if (box.x == x && box.y == y && box.w == w && box.h == h)
+            return true;
+        return false;
+    }
 
     double x, y, w, h;
 };
@@ -548,6 +553,13 @@ public:
         }
     }
 #endif
+    // Update heights according to new maxh
+    void update_heights(double maxh) {
+        for (auto win = windows.first(); win != nullptr; win = win->next()) {
+            Window *window = win->data();
+            window->update_height(window->get_height(), maxh);
+        }
+    }
     void update_width(ColumnWidth cwidth, double maxw, double maxh) {
         if (maximized()) {
             geom.w = maxw;
@@ -731,8 +743,10 @@ public:
         if (std::abs(static_cast<int>(delta.y)) > 0) {
             for (auto win = windows.first(); win != nullptr; win = win->next()) {
                 Window *window = win->data();
-                if (win == active)
+                if (win == active) {
                     window->set_geom_h(window->get_geom_h() + delta.y);
+                    window->set_height_free();
+                }
             }
         }
     }
@@ -1058,6 +1072,8 @@ public:
 
         reorder = Reorder::Auto;
         recalculate_row_geometry();
+
+        g_pEventManager->postEvent(SHyprIPCEvent{"scroller", "admitwindow"});
     }
     void expel_window_right() {
         if (active->data()->maximized() ||
@@ -1091,11 +1107,14 @@ public:
 
         reorder = Reorder::Auto;
         recalculate_row_geometry();
+
+        g_pEventManager->postEvent(SHyprIPCEvent{"scroller", "expelwindow"});
     }
     Vector2D predict_window_size() const {
         return Vector2D(0.5 * max.w, max.h);
     }
-    void update_sizes(CMonitor *monitor) {
+    // Returns the old viewport
+    Box update_sizes(CMonitor *monitor) {
         // for gaps outer
         static auto PGAPSINDATA = CConfigValue<Hyprlang::CUSTOMTYPE>("general:gaps_in");
         static auto PGAPSOUTDATA = CConfigValue<Hyprlang::CUSTOMTYPE>("general:gaps_out");
@@ -1103,7 +1122,7 @@ public:
         auto *const PGAPSOUT = (CCssGapData *)(PGAPSOUTDATA.ptr())->getData();
         // For now, support only constant CCssGapData
         auto gaps_in = PGAPSIN->top;
-        auto gaps_out = PGAPSOUT->top;
+        auto gaps_out = *PGAPSOUT;
 
         const auto SIZE = monitor->vecSize;
         const auto POS = monitor->vecPosition;
@@ -1111,11 +1130,15 @@ public:
         const auto BOTTOMRIGHT = monitor->vecReservedBottomRight;
 
         full = Box(POS, SIZE);
-        max = Box(POS.x + TOPLEFT.x + gaps_out,
-                POS.y + TOPLEFT.y + gaps_out,
-                SIZE.x - TOPLEFT.x - BOTTOMRIGHT.x - 2 * gaps_out,
-                SIZE.y - TOPLEFT.y - BOTTOMRIGHT.y - 2 * gaps_out);
+        const Box newmax = Box(POS.x + TOPLEFT.x + gaps_out.left,
+                POS.y + TOPLEFT.y + gaps_out.top,
+                SIZE.x - TOPLEFT.x - BOTTOMRIGHT.x - gaps_out.left - gaps_out.right,
+                SIZE.y - TOPLEFT.y - BOTTOMRIGHT.y - gaps_out.top - gaps_out.bottom);
         gap = gaps_in;
+
+        const Box oldmax = max;
+        max = newmax;
+        return oldmax;
     }
     void set_fullscreen_active_window() {
         active->data()->set_fullscreen(full);
@@ -1262,6 +1285,27 @@ public:
             }
             adjust_columns(active);
         }
+    }
+
+    void update_windows(const Box &oldmax) {
+        if (oldmax == max)
+            return;
+
+        // Update active column position
+        if (active) {
+            double posx = max.x + max.w * (active->data()->get_geom_x() - oldmax.x) / oldmax.w;
+            active->data()->set_geom_pos(posx, max.y);
+        }
+        // Redo all columns: widths according to "width" (unless Free)
+        for (auto col = columns.first(); col != nullptr; col = col->next()) {
+            Column *column = col->data();
+            ColumnWidth width = column->get_width();
+            double maxw = width == ColumnWidth::Free ? column->get_geom_w() : max.w;
+            column->update_width(width, maxw, max.h);
+            // Redo all windows for each column according to "height" (unless Free)
+            column->update_heights(max.h);
+        }
+        recalculate_row_geometry();
     }
 
     void recalculate_row_geometry() {
@@ -1505,19 +1549,19 @@ void ScrollerLayout::recalculateMonitor(const int &monitor_id)
     if (s == nullptr)
         return;
 
-    s->update_sizes(PMONITOR);
+    Box max = s->update_sizes(PMONITOR);
     if (PWORKSPACE->m_bHasFullscreenWindow && PWORKSPACE->m_efFullscreenMode == FULLSCREEN_FULL) {
         s->set_fullscreen_active_window();
     } else {
-        s->recalculate_row_geometry();
+        s->update_windows(max);
     }
     if (PMONITOR->activeSpecialWorkspaceID()) {
         auto sw = getRowForWorkspace(PMONITOR->activeSpecialWorkspaceID());
         if (sw == nullptr) {
             return;
         }
-        sw->update_sizes(PMONITOR);
-        sw->recalculate_row_geometry();
+        Box max = sw->update_sizes(PMONITOR);
+        sw->update_windows(max);
     }
 }
 
